@@ -75,6 +75,22 @@ services:
     volumes:
       - ./flink/checkpoints:/opt/flink/checkpoints
 
+  kafka-init:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: [ "/bin/sh", "-c" ]
+    command: |
+      "
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic polymarket-predictions-raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic weather-actuals-raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic market-weather-correlations --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic market-accuracy-aggregates --partitions 3 --replication-factor 1 --config retention.ms=2592000000 --config cleanup.policy=compact
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic arbitrage-alerts --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+      echo 'Topics created.'
+      "
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui

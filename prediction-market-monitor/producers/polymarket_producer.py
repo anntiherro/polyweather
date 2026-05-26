@@ -47,13 +47,6 @@ def parse_city(question: str) -> str | None:
     return None
 
 
-def validate_tokens(tokens: list) -> bool:
-    try:
-        total = sum(float(t["price"]) for t in tokens)
-        return abs(total - 1.0) <= 0.01
-    except (KeyError, TypeError, ValueError):
-        return False
-
 
 def fetch_markets() -> list:
     all_markets = []
@@ -92,7 +85,6 @@ def process_markets(markets: list):
         if not tokens:
             continue
 
-        prices_valid = validate_tokens(tokens)
         price_sum = sum(float(t.get("price", 0)) for t in tokens)
         arbitrage_flag = abs(price_sum - 1.0) > 0.01
 
@@ -118,7 +110,6 @@ def process_markets(markets: list):
             "tags": market.get("tags", []),
             "LOCATION_NAME": city,
             "POLL_TIMESTAMP": poll_ts,
-            "prices_valid": prices_valid,
             "price_sum": round(price_sum, 4),
             "arbitrage_flag": arbitrage_flag,
         }
