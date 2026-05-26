@@ -1,0 +1,493 @@
+Real-Time Prediction Market Accuracy Monitoring 
+
+ 
+
+ 
+
+Timeline: May 19 to June 12. 
+
+ 
+
+A quantitative research firm analyzing prediction markets has discovered an untapped opportunity in real-time market validation. Polymarket, a decentralized prediction platform, allows traders to bet on weather outcomes across different cities. However, nobody is systematically tracking how accurate these crowd-sourced predictions actually are when compared to real weather data. This is like finding a hidden goldmine of insights because it helps traders spot market inefficiencies, detect systematic biases, and identify arbitrage opportunities before anyone else. They want to build a streaming analytics system that correlates prediction market odds with actual weather in real-time, enabling instant alerts when markets become inaccurate, helping traders make smarter decisions and potentially profit from market corrections. 
+
+ 
+
+Stream Description 
+
+The system ingests two primary data streams that flow continuously into the pipeline: 
+
+Polymarket Prediction Stream 
+
+Weather Actuals Stream 
+
+ 
+
+Polymarket Prediction Stream 
+
+Collected via Polymarket API (https://clob.polymarket.com/markets) polling every 5 minutes: 
+
+condition_id - unique blockchain condition identifier 
+
+question_id - unique question identifier 
+
+question - market question text (e.g., "Will it rain in Seattle on May 20, 2026?") 
+
+market_slug - URL-friendly market identifier 
+
+end_date_iso - market close date (ISO 8601 format) 
+
+game_start_time - event/forecast timestamp (ISO 8601 format) 
+
+tokens - array of outcomes, each containing: 
+
+outcome - outcome label (e.g., "Yes", "No") 
+
+price - current probability (0.0 to 1.0) 
+
+winner - boolean, true if outcome occurred (null for open markets) 
+
+closed - boolean indicating if market is closed 
+
+active - boolean indicating if market accepts orders 
+
+tags - array of category tags (filter for "Weather") 
+
+POLL_TIMESTAMP - when data collected from API (added by producer) 
+
+Note: Token prices should sum to ~1.0 in efficient markets. Deviations >0.01 signal arbitrage opportunities. 
+
+ 
+
+Weather Actuals Stream 
+
+Collected via Open-Meteo API (https://api.open-meteo.com/v1/forecast) polling every 15 minutes: 
+
+latitude - location latitude 
+
+longitude - location longitude 
+
+current_units - units metadata object (confirms °C, mm, km/h, %) 
+
+current - object containing: 
+
+time - observation timestamp (ISO 8601 format) 
+
+temperature_2m - temperature in Celsius 
+
+precipitation - total precipitation in mm 
+
+rain - rain volume in mm 
+
+weather_code - WMO weather code (integer, 0=clear, 1-3=cloudy, 51-67=rain, 71-77=snow) 
+
+wind_speed_10m - wind speed in km/h 
+
+relative_humidity_2m - relative humidity percentage 
+
+LOCATION_NAME - city name (added by producer from geocoding cache) 
+
+POLL_TIMESTAMP - when data collected from API (added by producer, ISO 8601) 
+
+Note: API requires lat/lon coordinates. Producer maintains geocoding cache mapping Polymarket location names to coordinates. 
+
+ 
+
+ 
+
+Correlated Output Stream 
+
+After joining prediction and actuals: 
+
+All fields from both input streams, plus: 
+
+ACTUAL_OUTCOME - boolean indicating whether the prediction was correct (1 = correct, 0 = incorrect) 
+
+PREDICTION_ERROR - absolute difference between predicted odds and actual outcome (0.0 to 1.0) 
+
+CORRELATION_LATENCY_SEC - time between prediction timestamp and actual observation 
+
+Note: Individual markets (identified by condition_id) do not form continuous time series. Markets open and close dynamically based on specific events. Only location-level aggregations produce continuous series suitable for trend analysis. 
+
+ 
+
+Infrastructure Preparation 
+
+Use Docker Compose to provision the local streaming infrastructure: 
+
+Kafka Cluster (Docker) 
+
+Deploy single-node Kafka cluster using confluentinc/cp-kafka image (development setup). 
+
+Define 5 topics with appropriate partitioning: 
+
+polymarket-predictions-raw (3 partitions, retention 7 days) 
+
+weather-actuals-raw (3 partitions, retention 7 days) 
+
+market-weather-correlations (3 partitions, retention 30 days) 
+
+market-accuracy-aggregates (3 partitions, retention 30 days) 
+
+arbitrage-alerts (3 partitions, retention 30 days) 
+
+Enable Snappy compression to reduce disk usage. 
+
+Configure log compaction for aggregate topics to maintain latest state. 
+
+Apache Flink Cluster (Docker) 
+
+Deploy Flink using apache/flink:latest image with JobManager and TaskManager containers. 
+
+Configure local filesystem checkpointing with 60-second intervals (volume mount to host). 
+
+Configure restart strategy with exponential backoff (max 5 restart attempts per hour). 
+
+Storage and Database (Docker) 
+
+Deploy PostgreSQL container for storing aggregated metrics and dashboard queries. 
+
+Use local volume mounts for data persistence across container restarts. 
+
+Monitoring Stack (Docker) 
+
+Deploy Prometheus container for metrics collection from Kafka and Flink JMX exporters. 
+
+Set up Grafana container with pre-configured dashboards for pipeline monitoring. 
+
+Use docker-compose networking for service discovery between containers. 
+
+All infrastructure defined in docker-compose.yml stored in version control repository. 
+
+ 
+
+Stream Processing Pipeline 
+
+Build a real-time data pipeline using Kafka producers and Flink stream processors: 
+
+1. Polymarket Data Producer (Python Service) 
+
+Poll Polymarket API every 5 minutes to fetch active weather prediction markets. 
+
+Filter markets by tag "Weather" and question content (RAIN, TEMPERATURE, SNOW keywords). 
+
+Parse location from question text (e.g., "Will it rain in Seattle..." → "Seattle"). 
+
+Extract prediction details: event date/time from game_start_time, outcome probabilities from tokens array. 
+
+Validate data quality: ensure token prices sum to ~1.0 within ±0.01 tolerance. 
+
+Detect and flag potential arbitrage opportunities at the source (price sum deviates >1%). 
+
+Produce validated records to polymarket-predictions-raw Kafka topic. 
+
+Implement exponential backoff retry logic for API failures (starting at 1 second, max 16 seconds). 
+
+2. Weather Data Producer (Python Service) 
+
+Poll Open-Meteo API every 15 minutes for current weather observations. 
+
+Dynamically track locations based on active Polymarket markets (extract city names from market questions). 
+
+Maintain geocoding cache: map city names to lat/lon coordinates (use geopy or similar library for one-time lookup). 
+
+Query Open-Meteo with coordinates: ?latitude={lat}&longitude={lon}&current=temperature_2m,precipitation,rain,weather_code,wind_speed_10m,relative_humidity_2m 
+
+Add LOCATION_NAME field from cache for correlation with Polymarket data. 
+
+Produce observations to weather-actuals-raw Kafka topic. 
+
+Implement local caching to avoid duplicate API calls for same location within 15-minute window. 
+
+3. Real-Time Correlation Engine (Flink Job) 
+
+Consume from both polymarket-predictions-raw and weather-actuals-raw topics. 
+
+Perform temporal join operation: 
+
+Join key: LOCATION_NAME (standardized city name added by both producers) 
+
+Time window: event-time based with 15-minute allowance for late-arriving weather data 
+
+Match condition: game_start_time (Polymarket) aligns with current.time (Open-Meteo) 
+
+Calculate prediction accuracy: 
+
+For boolean predictions (RAIN vs NO_RAIN): exact match comparison 
+
+For continuous predictions (TEMPERATURE): calculate error margin in degrees 
+
+Produce correlated records to market-weather-correlations topic. 
+
+Use tumbling windows of 1 hour for event-time processing. 
+
+Maintain stateful storage of pending predictions (TTL: 24 hours) waiting for matching weather actuals. 
+
+4. Accuracy Aggregation Processor (Flink Job) 
+
+Consume from market-weather-correlations topic. 
+
+Compute rolling metrics per market over sliding 1-hour windows (15-minute slide interval): 
+
+Accuracy rate: percentage of correct predictions 
+
+Average prediction error: mean absolute difference between odds and outcomes 
+
+Volume-weighted accuracy: weight accuracy by trading volume 
+
+Bias score: detect systematic over-prediction or under-prediction patterns 
+
+Produce aggregated metrics to market-accuracy-aggregates topic. 
+
+Store intermediate state for incremental computation of running statistics. 
+
+5. Anomaly Detection and Alerting (Flink Job) 
+
+Consume from market-accuracy-aggregates topic. 
+
+Maintain 7-day rolling baseline statistics (mean and standard deviation) per market. 
+
+Detect anomalies using statistical thresholds: 
+
+Flag markets with accuracy deviation greater than 2 standard deviations from baseline 
+
+Alert on sudden accuracy drops exceeding 20% within 1-hour window 
+
+Detect arbitrage opportunities: 
+
+Monitor markets where sum of token prices ≠ 1.0 
+
+Calculate expected profit margin percentage 
+
+Produce high-priority alerts to arbitrage-alerts topic. 
+
+6. Data Quality and Validation Layer 
+
+Enforce schema validation using Confluent Schema Registry (Avro or Protobuf format). 
+
+Monitor producer health: alert if any producer stops sending data for more than 10 minutes. 
+
+Track join coverage rate: ensure at least 95% of predictions successfully match with weather actuals. 
+
+Monitor end-to-end latency: track p99 latency from API poll to correlation output (target: <5 minutes). 
+
+Flag data quality issues: impossible values like negative odds, odds exceeding 1.0, or negative volumes. 
+
+7. Real-Time Dashboard and Visualization 
+
+Build interactive dashboard using Grafana, Streamlit, or Apache Superset. 
+
+Real-time views: 
+
+Live geographical map showing active markets with current accuracy per location 
+
+Streaming line chart of accuracy rate over last 24 hours 
+
+Alert feed displaying recent anomalies and arbitrage opportunities 
+
+Market leaderboard ranking most and least accurate prediction markets 
+
+Historical analysis views: 
+
+Time-series charts showing accuracy trends per location over weeks 
+
+Heatmap visualization: prediction type × location × day-of-week accuracy patterns 
+
+Scatter plot for bias analysis: predicted odds versus actual outcomes 
+
+Correlation analysis: does higher trading volume correlate with higher accuracy? 
+
+Arbitrage dashboard: 
+
+Real-time table of markets with odds sum deviating from 1.0 
+
+Expected profit calculator based on odds discrepancies 
+
+Historical frequency chart of arbitrage occurrence patterns 
+
+ 
+
+Possible pipeline structure: 
+
+polymarket_producer >> polymarket-predictions-raw >> weather_producer >> weather-actuals-raw >> flink_correlation_job >> market-weather-correlations >> flink_aggregation_job >> market-accuracy-aggregates >> flink_anomaly_job >> arbitrage-alerts >> postgresql >> grafana_dashboard 
+
+ 
+
+Tasks should be performed in the following stages: 
+
+MVP: Components 1, 2, 3, and basic validation (data quality layer). 
+
+Full version: MVP + components 4, 5, 6, 7 (complete analytics and alerting). 
+
+All code should be stored in version control repository with CI/CD pipeline integration. 
+
+ 
+
+Additional Considerations 
+
+Implement comprehensive error handling with exponential backoff and circuit breaker patterns for all external API calls and Kafka connectivity failures to ensure pipeline resilience. 
+
+Configure Flink restart strategy with exponential delay backoff (maximum 5 restart attempts per hour) to handle transient failures without overloading the system. 
+
+Implement idempotent producers and deduplication logic in Flink using keyed state (1-hour TTL) to prevent duplicate processing of events. 
+
+Set up monitoring alerts for critical conditions: 
+
+Producer stops sending data for more than 10 minutes (PagerDuty alert) 
+
+Kafka consumer lag exceeds 100,000 messages (immediate investigation) 
+
+Flink job enters restart loop (3+ restarts within 10 minutes) 
+
+Join coverage rate drops below 70% (data quality issue) 
+
+Optimize resource usage: 
+
+Monitor container memory and CPU usage, right-size resource limits in docker-compose.yml 
+
+Implement intelligent API polling: reduce frequency for closed/low-volume markets 
+
+Use volume mounts for persistent data to avoid data loss on container restart 
+
+Clean up old checkpoint files periodically to save disk space 
+
+Ensure security: 
+
+Store configuration in .env file (excluded from version control) 
+
+Use Docker networks to isolate services 
+
+Bind services to localhost only (no external exposure unless needed) 
+
+Enable TLS for Kafka if exposing outside local machine 
+
+Ensure proper cleanup of temporary resources, intermediate state, and checkpoint files after pipeline execution to avoid unnecessary storage costs accumulating over time. 
+
+ 
+
+The presentation should contain, apart from the technical solution, a cost analysis covering: 
+
+Local infrastructure: estimated electricity cost for running Docker containers 24/7 
+
+API costs: Both Polymarket and Open-Meteo are free with no rate limits (zero cost) 
+
+Storage: local disk usage projections (Kafka retention, checkpoints, PostgreSQL data) 
+
+Total estimated operational cost for MVP and Full version (minimal: electricity + disk only) 
+
+Cost projection if deployed to cloud production (AWS/GCP/Azure comparison) 
+
+ 
+
+Test Scenarios 
+
+Coming soon.... 
+
+ 
+
+Deliverables 
+
+Infrastructure as Code Repository 
+
+Docker Compose configuration (docker-compose.yml) for all services 
+
+Comprehensive documentation in DEPLOYMENT.md 
+
+Resource limits and volume mount configuration 
+
+Application Code Repository 
+
+Python producer services with unit tests achieving >80% code coverage 
+
+Flink stream processing jobs (Scala or Java) with integration tests 
+
+Requirements.txt and environment setup scripts 
+
+All code reviewed and working in local environment 
+
+Technical Documentation 
+
+System architecture diagram showing all components and data flows 
+
+API documentation for external consumers of alerts and metrics 
+
+Operational runbook covering common maintenance tasks 
+
+Troubleshooting guide for frequent issues and resolution steps 
+
+Final Presentation (15-20 slides) 
+
+Executive summary: why prediction market accuracy monitoring matters for traders 
+
+Technical architecture overview with visual diagrams 
+
+Live demonstration: dashboard showing real streaming data and alerts 
+
+Cost analysis: 
+
+Local development: minimal (electricity, disk space) 
+
+API usage: both APIs permanently free for non-commercial use (zero cost) 
+
+Cloud deployment estimate: infrastructure costs if scaled to production 
+
+Key performance metrics: latency percentiles, accuracy rates, join coverage 
+
+Lessons learned during implementation 
+
+Future enhancement roadmap (cloud deployment, additional data sources, ML models) 
+
+Cost Analysis Document 
+
+Local setup costs (negligible infrastructure, no API fees) 
+
+Cloud migration cost estimate (AWS/GCP/Azure comparison) 
+
+Projected scaling costs (10x, 100x, 1000x traffic scenarios) 
+
+ 
+
+Data Sources 
+
+Primary APIs: 
+
+Polymarket API: https://clob.polymarket.com/markets (no API key, no rate limits) 
+
+Open-Meteo API: https://api.open-meteo.com/v1/forecast (no API key, no rate limits) 
+
+Geocoding Library: 
+
+geopy or similar for city name → lat/lon conversion (one-time lookups, cached locally) 
+
+Synthetic Test Data (if live APIs unavailable during development): 
+
+sample_polymarket_predictions.json (1000 sample prediction records) 
+
+sample_weather_actuals.json (1000 sample weather observations from Open-Meteo format) 
+
+Success Metrics 
+
+Technical Performance Metrics: 
+
+System uptime: greater than 99.5% availability 
+
+End-to-end latency p99: less than 5 minutes from API poll to correlation output 
+
+Join coverage rate: greater than 95% of predictions successfully matched with actuals 
+
+Data loss: 0% (exactly-once processing semantics maintained) 
+
+Business Value Metrics: 
+
+Anomaly detection recall: greater than 90% (successfully catch 9 out of 10 real market anomalies) 
+
+Anomaly detection precision: greater than 80% (less than 20% false positive rate) 
+
+Arbitrage opportunity detection speed: less than 1 minute from market creation to alert 
+
+ 
+
+ 
+
+ 
+
+ 

@@ -1,0 +1,90 @@
+services:
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    hostname: kafka
+
+    ports:
+      - "9092:9092"
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_INTERNAL://:29092,CONTROLLER://:29093
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+      KAFKA_COMPRESSION_TYPE: snappy
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  flink-jobmanager:
+    image: apache/flink:latest
+    container_name: flink-jobmanager
+
+    ports:
+      - "8081:8081"
+
+    command: jobmanager
+
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 60000
+
+    volumes:
+      - ./flink/checkpoints:/opt/flink/checkpoints
+
+  flink-taskmanager:
+    image: apache/flink:latest
+    container_name: flink-taskmanager
+
+    depends_on:
+      - flink-jobmanager
+
+    command: taskmanager
+
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 60000
+
+    volumes:
+      - ./flink/checkpoints:/opt/flink/checkpoints
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+
+volumes:
+  kafka-data:
