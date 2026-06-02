@@ -83,6 +83,8 @@ services:
     entrypoint: [ "/bin/sh", "-c" ]
     command: |
       "
+      echo 'Waiting for Kafka...'
+      until kafka-topics --bootstrap-server kafka:29092 --list > /dev/null 2>&1; do sleep 2; done
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic polymarket-predictions-raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic weather-actuals-raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic market-weather-correlations --partitions 3 --replication-factor 1 --config retention.ms=2592000000

@@ -5,16 +5,19 @@ import requests
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 
-POLYMARKET_API = "https://clob.polymarket.com/markets"
+GAMMA_API = "https://gamma-api.polymarket.com/events"
 KAFKA_TOPIC = "polymarket-predictions-raw"
 POLL_INTERVAL = 300  # 5 minutes
 
-WEATHER_KEYWORDS = ["rain", "temperature", "snow", "precipitation", "wind", "storm"]
-CITY_PATTERN = re.compile(r"\bin\s+([A-Z][a-zA-Z\s]+?)(?:\s+on|\s+during|\s+for|\?|$)")
+# daily-temperature tag targets city-level temperature markets (Warsaw, Tokyo, London etc.)
+WEATHER_TAG_SLUG = "daily-temperature"
+
+WEATHER_KEYWORDS = ["rain", "temperature", "snow", "precipitation", "wind", "storm", "weather", "hurricane", "flood"]
+CITY_PATTERN = re.compile(r"\bin\s+([A-Z][a-zA-Z\s']+?)(?:\s+be\s|\s+on\s|\s+during|\s+for|\?|$)")
 
 producer = KafkaProducer(
     bootstrap_servers="localhost:9092",
-    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
     acks="all",
     retries=3,
 )
@@ -35,90 +38,120 @@ def fetch_with_backoff(url, params=None, max_retries=5):
     return None
 
 
-def is_weather_market(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in WEATHER_KEYWORDS)
+def is_weather_market(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in WEATHER_KEYWORDS)
 
 
 def parse_city(question: str) -> str | None:
+    # Try "in <City>" pattern
     match = CITY_PATTERN.search(question)
     if match:
         return match.group(1).strip()
+
+    # Try "temperature in <City>" or "temperature <City>"
+    match2 = re.search(r"temperature\s+(?:in\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+on|\?|$)", question)
+    if match2:
+        return match2.group(1).strip()
+
     return None
 
 
-
 def fetch_markets() -> list:
-    all_markets = []
-    next_cursor = None
+    all_events = []
+    offset = 0
+    limit = 100
 
     while True:
-        params = {"tag": "Weather"}
-        if next_cursor:
-            params["next_cursor"] = next_cursor
+        params = {
+            "tag_slug": WEATHER_TAG_SLUG,
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+            "order": "startDate",
+            "ascending": "false",
+        }
 
-        data = fetch_with_backoff(POLYMARKET_API, params=params)
+        data = fetch_with_backoff(GAMMA_API, params=params)
         if not data:
             break
 
-        markets = data.get("data", [])
-        all_markets.extend(markets)
+        all_events.extend(data)
 
-        next_cursor = data.get("next_cursor")
-        if not next_cursor or next_cursor == "LTE=":
+        if len(data) < limit:
             break
+        offset += limit
 
-    return all_markets
+    return all_events
 
 
-def process_markets(markets: list):
+def process_events(events: list):
     sent = 0
     poll_ts = datetime.now(timezone.utc).isoformat()
 
-    for market in markets:
-        question = market.get("question", "")
+    for event in events:
+        title = event.get("title", "")
+        markets = event.get("markets", [])
 
-        if not is_weather_market(question):
+        if not markets:
             continue
 
-        tokens = market.get("tokens", [])
-        if not tokens:
-            continue
+        for market in markets:
+            question = market.get("question", "")
 
-        price_sum = sum(float(t.get("price", 0)) for t in tokens)
-        arbitrage_flag = abs(price_sum - 1.0) > 0.01
+            if not is_weather_market(question) and not is_weather_market(title):
+                continue
 
-        city = parse_city(question)
+            raw_prices = market.get("outcomePrices", "[]")
+            if isinstance(raw_prices, str):
+                raw_prices = json.loads(raw_prices)
 
-        record = {
-            "condition_id": market.get("condition_id"),
-            "question_id": market.get("question_id"),
-            "question": question,
-            "market_slug": market.get("market_slug"),
-            "end_date_iso": market.get("end_date_iso"),
-            "game_start_time": market.get("game_start_time"),
-            "closed": market.get("closed", False),
-            "active": market.get("active", False),
-            "tokens": [
-                {
-                    "outcome": t.get("outcome"),
-                    "price": float(t.get("price", 0)),
-                    "winner": t.get("winner"),
-                }
-                for t in tokens
-            ],
-            "tags": market.get("tags", []),
-            "LOCATION_NAME": city,
-            "POLL_TIMESTAMP": poll_ts,
-            "price_sum": round(price_sum, 4),
-            "arbitrage_flag": arbitrage_flag,
-        }
+            raw_outcomes = market.get("outcomes", "[]")
+            if isinstance(raw_outcomes, str):
+                raw_outcomes = json.loads(raw_outcomes)
 
-        producer.send(KAFKA_TOPIC, value=record)
-        sent += 1
+            if not raw_prices:
+                continue
 
-        if arbitrage_flag:
-            print(f"[ARBITRAGE] {question[:60]} | sum={price_sum:.4f}")
+            token_list = [
+                {"outcome": raw_outcomes[i] if i < len(raw_outcomes) else str(i), "price": float(raw_prices[i]), "winner": None}
+                for i in range(len(raw_prices))
+            ]
+
+            if not token_list:
+                continue
+
+            price_sum = sum(t["price"] for t in token_list)
+            arbitrage_flag = abs(price_sum - 1.0) > 0.01
+
+            city = parse_city(question) or parse_city(title)
+
+            record = {
+                "condition_id": market.get("conditionId"),
+                "question_id": market.get("id"),
+                "question": question,
+                "market_slug": market.get("slug"),
+                "end_date_iso": market.get("endDate"),
+                "game_start_time": market.get("startDate"),
+                "closed": market.get("closed", False),
+                "active": market.get("active", True),
+                "tokens": [
+                    {"outcome": t["outcome"], "price": t["price"], "winner": t["winner"]}
+                    for t in token_list
+                ],
+                "tags": [event.get("slug", "")],
+                "LOCATION_NAME": city,
+                "POLL_TIMESTAMP": poll_ts,
+                "price_sum": round(price_sum, 4),
+                "arbitrage_flag": arbitrage_flag,
+            }
+
+            producer.send(KAFKA_TOPIC, value=record)
+            sent += 1
+
+            if arbitrage_flag:
+                print(f"[ARBITRAGE] {question[:60]} | sum={price_sum:.4f}")
 
     producer.flush()
     print(f"[{poll_ts}] sent {sent} weather markets")
@@ -127,11 +160,11 @@ def process_markets(markets: list):
 def main():
     print("Polymarket producer started")
     while True:
-        markets = fetch_markets()
-        if markets:
-            process_markets(markets)
+        events = fetch_markets()
+        if events:
+            process_events(events)
         else:
-            print("No markets fetched, retrying next cycle")
+            print("No events fetched, retrying next cycle")
         time.sleep(POLL_INTERVAL)
 
 
