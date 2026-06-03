@@ -1,0 +1,18 @@
+# Maven
+target/
+*.class
+*.jar
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Claude
+.claude/settings.local.json
+memory/
+
+# OS
+.DS_Store
+Thumbs.db
