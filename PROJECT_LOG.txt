@@ -1,0 +1,162 @@
+Real-Time Prediction Market Accuracy Monitoring — Project Log
+=============================================================
+Date: June 3, 2026
+Stack: Python, Apache Kafka, Apache Flink (Java), Docker, Open-Meteo API, Gamma API (Polymarket)
+
+
+ЦЕЛЬ ПРОЕКТА
+------------
+Построить streaming pipeline который в реальном времени сравнивает ставки на погоду
+с Polymarket с реальными данными погоды (Open-Meteo), чтобы находить неточные рынки
+и арбитражные возможности для трейдеров.
+
+Пример: маркет "Will it rain in Warsaw today?" торгуется по Yes=30%, но Open-Meteo
+показывает дождь прямо сейчас — рынок недооценён, это торговая возможность.
+
+
+ИНФРАСТРУКТУРА
+--------------
+Docker Compose поднимает:
+- Kafka (confluentinc/cp-kafka, KRaft mode, без Zookeeper)
+- Flink JobManager + TaskManager (apache/flink:latest = 2.2.1)
+- kafka-init: создаёт 5 топиков при старте
+- Kafka UI (provectuslabs/kafka-ui) на localhost:8080
+- Flink UI на localhost:8081
+
+Топики:
+- polymarket-predictions-raw (3 партиции, retention 7 дней)
+- weather-actuals-raw (3 партиции, retention 7 дней)
+- market-weather-correlations (3 партиции, retention 30 дней)
+- market-accuracy-aggregates (3 партиции, retention 30 дней)
+- arbitrage-alerts (3 партиции, retention 30 дней)
+
+Kafka настроена со Snappy компрессией — потребовала установки python-snappy
+на хосте для Python producers.
+
+
+КОМПОНЕНТ 1: POLYMARKET PRODUCER
+---------------------------------
+Файл: prediction-market-monitor/producers/polymarket_producer.py
+
+Изначально использовал CLOB API (clob.polymarket.com) — не поддерживал нужную
+фильтрацию. Переписан под Gamma API (gamma-api.polymarket.com/events) с тегом
+"daily-temperature".
+
+Ключевые решения:
+- Фильтр по end_date = сегодня (только актуальные маркеты, ~627 штук)
+- In-memory кеш цен (_price_cache): шлём в Kafka только если цена изменилась
+  с прошлого poll — избегаем дублирования 600+ записей каждые 5 минут
+- Парсинг города из текста вопроса (regex: "in <City>", "temperature in <City>")
+- Экспоненциальный backoff для API ретраев (1→16 сек)
+- POLL_TIMESTAMP в формате ISO 8601 без микросекунд ("%Y-%m-%dT%H:%M:%SZ")
+
+
+КОМПОНЕНТ 2: WEATHER PRODUCER
+------------------------------
+Файл: prediction-market-monitor/producers/weather_producer.py
+
+Изначально был написан с хардкодом городов и конечным циклом (LIMIT=10).
+Полностью переписан:
+
+- Динамически читает активные города из топика polymarket-predictions-raw (Kafka consumer)
+  вместо повторных вызовов Gamma API — логичная декомпозиция, weather producer
+  не должен знать про Polymarket API
+- Геокодирование через geopy/Nominatim с in-memory кешем (1 запрос/сек rate limit)
+- Запрашивает текущую погоду (current) у Open-Meteo для каждого города
+- Бесконечный цикл, poll каждые 15 минут
+- Структура записи соответствует спеке: current, current_units, LOCATION_NAME, POLL_TIMESTAMP
+
+Зависимости: geopy, python-snappy (для Snappy декомпрессии Kafka)
+
+
+КОМПОНЕНТ 3: FLINK CORRELATION JOB
+------------------------------------
+Файл: prediction-market-monitor/flink/jobs/src/main/java/com/polyweather/CorrelationJob.java
+Build: Maven (pom.xml), собирается в fat JAR через maven-shade-plugin
+
+Логика:
+- Читает оба топика из Kafka (latest offset — только новые сообщения)
+- Ключует оба потока по LOCATION_NAME
+- CoFlatMapFunction: weather обновляет state, polymarket джойнит с последней погодой
+- Для каждой пары считает: target_temp из вопроса (regex), actual_temp из погоды,
+  ACTUAL_OUTCOME (exact/above/below match), PREDICTION_ERROR, CORRELATION_LATENCY_SEC
+- Пишет результат в market-weather-correlations
+
+Пример выходной записи:
+  "Will the lowest temperature in Tokyo be 18°C on June 3?"
+  yes_price=0.037, actual_temp=19.1°C → ACTUAL_OUTCOME=0, PREDICTION_ERROR=0.037
+
+
+ПРОБЛЕМЫ И РЕШЕНИЯ
+-------------------
+
+1. Docker не запускался — Docker Desktop был закрыт. Решение: запустить вручную.
+
+2. kafka-init падал раньше чем Kafka готова — добавлен wait-loop:
+   until kafka-topics --list > /dev/null; do sleep 2; done
+
+3. Python kafka consumer не мог читать Snappy-сжатые сообщения:
+   UnsupportedCodecError. Решение: pip install python-snappy
+
+4. Flink job: UnsupportedClassVersionError — скомпилировали под Java 21,
+   Flink работает на Java 17. Решение: maven.compiler.source/target=17
+
+5. Flink job: NoClassDefFoundError TwoPhaseCommittingSink — версия
+   flink-connector-kafka 3.4.0-1.20 не совместима с Flink 2.2.1.
+   Решение: обновить до 4.0.0-2.0
+
+6. Flink job: open(Configuration) — в Flink 2.x API изменился,
+   нужен open(OpenContext). Решение: исправить сигнатуру метода.
+
+7. Flink job: NoSuchMethodError getNumberTypeFP — конфликт версий Jackson.
+   Flink 2.2.1 бандлит Jackson 2.15.3, Kafka connector требует 2.16+.
+   Решение: добавить jackson-core/databind 2.17.3 в fat JAR + использовать
+   flink-shaded-jackson для компиляции.
+
+8. DateTimeParseException: Python datetime.isoformat() генерирует
+   "2026-06-03T09:45:05.928630+00:00" с микросекундами и timezone offset,
+   Java Instant.parse ожидает чистый ISO формат.
+   Решение: strftime("%Y-%m-%dT%H:%M:%SZ") в обоих продьюсерах.
+
+9. Flink job читал с earliest offset — обрабатывал все 600+ polymarket записей
+   до того как weather попадал в state → correlations топик оставался пустым.
+   Решение: переключить на latest offset (только новые сообщения).
+
+10. Концептуальная проблема: большинство маркетов Polymarket сегодня —
+    "highest/lowest temperature of the day". Сравнение с текущей температурой
+    некорректно до конца дня. Обсуждены варианты:
+    - Использовать winner field (когда маркет закрылся)
+    - Запрашивать daily forecast вместо current погоды
+    Решение для MVP: оставить current погоду, признать что ACTUAL_OUTCOME
+    для daily маркетов промежуточный до конца дня.
+
+
+ТЕКУЩИЙ СТАТУС (на конец дня)
+------------------------------
+Готово (MVP частично):
+✓ Инфраструктура Docker Compose (Kafka + Flink + UI)
+✓ Polymarket producer (фильтрация по дате, delta-only отправка)
+✓ Weather producer (динамические города из Kafka)
+✓ Flink Correlation Job (RUNNING, пишет в market-weather-correlations)
+✓ End-to-end pipeline работает: данные текут через все 3 компонента
+
+Не сделано (следующие сессии):
+- Компонент 4: Accuracy Aggregation (sliding windows, rolling metrics)
+- Компонент 5: Anomaly Detection + Arbitrage Alerts
+- Компонент 6: Data Quality Layer
+- Компонент 7: Dashboard (Grafana / Streamlit)
+- PostgreSQL для хранения агрегатов
+- Weather producer: переход на daily forecast для корректного сравнения
+- requirements.txt (удалён, нужно восстановить)
+
+
+ЗАВИСИМОСТИ ДЛЯ ЗАПУСКА
+------------------------
+Python (хост):
+  pip install kafka-python requests geopy python-snappy
+
+Java/Maven:
+  JDK 17+ (установлен: Microsoft OpenJDK 21)
+  Maven 3.9+ (установлен: ~/.maven/apache-maven-3.9.16)
+
+Docker: все сервисы через docker compose up -d

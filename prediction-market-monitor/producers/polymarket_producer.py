@@ -15,6 +15,9 @@ WEATHER_TAG_SLUG = "daily-temperature"
 WEATHER_KEYWORDS = ["rain", "temperature", "snow", "precipitation", "wind", "storm", "weather", "hurricane", "flood"]
 CITY_PATTERN = re.compile(r"\bin\s+([A-Z][a-zA-Z\s']+?)(?:\s+be\s|\s+on\s|\s+during|\s+for|\?|$)")
 
+# condition_id -> tuple of prices, to detect changes
+_price_cache: dict[str, tuple] = {}
+
 producer = KafkaProducer(
     bootstrap_servers="localhost:9092",
     value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
@@ -63,10 +66,13 @@ def fetch_markets() -> list:
     limit = 100
 
     while True:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         params = {
             "tag_slug": WEATHER_TAG_SLUG,
             "active": "true",
             "closed": "false",
+            "end_date_min": f"{today}T00:00:00Z",
+            "end_date_max": f"{today}T23:59:59Z",
             "limit": limit,
             "offset": offset,
             "order": "startDate",
@@ -88,7 +94,7 @@ def fetch_markets() -> list:
 
 def process_events(events: list):
     sent = 0
-    poll_ts = datetime.now(timezone.utc).isoformat()
+    poll_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for event in events:
         title = event.get("title", "")
@@ -146,6 +152,11 @@ def process_events(events: list):
                 "price_sum": round(price_sum, 4),
                 "arbitrage_flag": arbitrage_flag,
             }
+
+            prices_key = tuple(t["price"] for t in token_list)
+            if _price_cache.get(market.get("conditionId")) == prices_key:
+                continue
+            _price_cache[market.get("conditionId")] = prices_key
 
             producer.send(KAFKA_TOPIC, value=record)
             sent += 1
