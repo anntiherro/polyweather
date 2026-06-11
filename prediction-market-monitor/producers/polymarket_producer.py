@@ -2,20 +2,18 @@ import json
 import time
 import re
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from kafka import KafkaProducer
 
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 KAFKA_TOPIC = "polymarket-predictions-raw"
 POLL_INTERVAL = 300  # 5 minutes
 
-# daily-temperature tag targets city-level temperature markets (Warsaw, Tokyo, London etc.)
 WEATHER_TAG_SLUG = "daily-temperature"
 
 WEATHER_KEYWORDS = ["rain", "temperature", "snow", "precipitation", "wind", "storm", "weather", "hurricane", "flood"]
 CITY_PATTERN = re.compile(r"\bin\s+([A-Z][a-zA-Z\s']+?)(?:\s+be\s|\s+on\s|\s+during|\s+for|\?|$)")
 
-# condition_id -> tuple of prices, to detect changes
 _price_cache: dict[str, tuple] = {}
 
 producer = KafkaProducer(
@@ -47,12 +45,10 @@ def is_weather_market(text: str) -> bool:
 
 
 def parse_city(question: str) -> str | None:
-    # Try "in <City>" pattern
     match = CITY_PATTERN.search(question)
     if match:
         return match.group(1).strip()
 
-    # Try "temperature in <City>" or "temperature <City>"
     match2 = re.search(r"temperature\s+(?:in\s+)?([A-Z][a-zA-Z\s]+?)(?:\s+on|\?|$)", question)
     if match2:
         return match2.group(1).strip()
@@ -61,6 +57,7 @@ def parse_city(question: str) -> str | None:
 
 
 def fetch_markets() -> list:
+    """Fetch today's open weather markets."""
     all_events = []
     offset = 0
     limit = 100
@@ -76,6 +73,38 @@ def fetch_markets() -> list:
             "limit": limit,
             "offset": offset,
             "order": "startDate",
+            "ascending": "false",
+        }
+
+        data = fetch_with_backoff(GAMMA_API, params=params)
+        if not data:
+            break
+
+        all_events.extend(data)
+
+        if len(data) < limit:
+            break
+        offset += limit
+
+    return all_events
+
+
+def fetch_closed_markets() -> list:
+    """Fetch yesterday's resolved weather markets for accuracy evaluation."""
+    all_events = []
+    offset = 0
+    limit = 100
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    while True:
+        params = {
+            "tag_slug": WEATHER_TAG_SLUG,
+            "closed": "true",
+            "end_date_min": f"{yesterday}T00:00:00Z",
+            "end_date_max": f"{yesterday}T23:59:59Z",
+            "limit": limit,
+            "offset": offset,
+            "order": "endDate",
             "ascending": "false",
         }
 
@@ -120,8 +149,15 @@ def process_events(events: list):
             if not raw_prices:
                 continue
 
+            # For resolved markets, the winner field contains the winning outcome name
+            market_winner = market.get("winner")
+
             token_list = [
-                {"outcome": raw_outcomes[i] if i < len(raw_outcomes) else str(i), "price": float(raw_prices[i]), "winner": None}
+                {
+                    "outcome": raw_outcomes[i] if i < len(raw_outcomes) else str(i),
+                    "price": float(raw_prices[i]),
+                    "winner": (raw_outcomes[i] == market_winner) if market_winner and i < len(raw_outcomes) else None,
+                }
                 for i in range(len(raw_prices))
             ]
 
@@ -142,10 +178,7 @@ def process_events(events: list):
                 "game_start_time": market.get("startDate"),
                 "closed": market.get("closed", False),
                 "active": market.get("active", True),
-                "tokens": [
-                    {"outcome": t["outcome"], "price": t["price"], "winner": t["winner"]}
-                    for t in token_list
-                ],
+                "tokens": token_list,
                 "tags": [event.get("slug", "")],
                 "LOCATION_NAME": city,
                 "POLL_TIMESTAMP": poll_ts,
@@ -153,10 +186,12 @@ def process_events(events: list):
                 "arbitrage_flag": arbitrage_flag,
             }
 
-            prices_key = tuple(t["price"] for t in token_list)
-            if _price_cache.get(market.get("conditionId")) == prices_key:
-                continue
-            _price_cache[market.get("conditionId")] = prices_key
+            # Closed markets always resend (prices frozen at 0/1, cache would block them forever)
+            if not market.get("closed", False):
+                prices_key = tuple(t["price"] for t in token_list)
+                if _price_cache.get(market.get("conditionId")) == prices_key:
+                    continue
+                _price_cache[market.get("conditionId")] = prices_key
 
             producer.send(KAFKA_TOPIC, value=record)
             sent += 1
@@ -175,7 +210,15 @@ def main():
         if events:
             process_events(events)
         else:
-            print("No events fetched, retrying next cycle")
+            print("No open events fetched")
+
+        closed_events = fetch_closed_markets()
+        if closed_events:
+            print(f"Processing {len(closed_events)} closed events from yesterday")
+            process_events(closed_events)
+        else:
+            print("No closed events from yesterday")
+
         time.sleep(POLL_INTERVAL)
 
 

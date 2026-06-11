@@ -160,3 +160,120 @@ Java/Maven:
   Maven 3.9+ (установлен: ~/.maven/apache-maven-3.9.16)
 
 Docker: все сервисы через docker compose up -d
+
+
+CHOSEN STRATEGY: HYBRID WEATHER DATA (Variant C)
+-------------------------------------------------
+Decided: June 11, 2026
+
+The core problem (issue #10) is that most Polymarket markets ask about daily
+high/low temperatures ("Will the highest temp in Tokyo be 18°C today?"), making
+it incorrect to compare against the current real-time temperature until end of day.
+
+Chosen approach — hybrid data sourcing based on market status:
+
+1. OPEN markets (active, no winner yet):
+   - Fetch daily forecast from Open-Meteo Forecast API (temperature_2m_max /
+     temperature_2m_min). This gives an intra-day directional signal — not ground
+     truth, but useful for detecting obvious mispricings while the market is live.
+
+2. CLOSED markets (resolved, winner field is set):
+   - Fetch actual historical data from Open-Meteo Archive API for the market's
+     end date. Compare the real daily max/min against the market's resolved outcome
+     (winner = Yes/No) to build a ground-truth accuracy record.
+
+Why this matters:
+   Closed markets + archive data provide the ground truth needed to measure how
+   well Polymarket prices reflect reality over time. Accumulating this accuracy
+   history per city and question type enables detection of systematically
+   mispriced markets — the core trading signal the pipeline is designed to produce.
+
+Implementation plan:
+   - Weather producer: add second fetch mode for daily forecast (max/min) and
+     archive lookups for resolved markets
+   - Flink Correlation Job: add branch for closed-market processing using winner
+     field and historical weather
+   - Component 4 (Accuracy Aggregation): rolling accuracy metrics per city,
+     powered by the closed-market ground truth
+
+
+СЕССИЯ 2 — June 11, 2026
+--------------------------
+
+РЕАЛИЗАЦИЯ СТРАТЕГИИ C (Hybrid Weather Data)
+
+1. polymarket_producer.py
+   - Добавлен fetch_closed_markets() — забирает вчерашние закрытые маркеты
+     из Gamma API (closed=true, end_date=yesterday)
+   - Исправлено извлечение поля winner из market.winner API
+   - Закрытые маркеты не кешируются в _price_cache (иначе цены 0.0/1.0
+     никогда не меняются и маркеты не переотправляются)
+
+2. weather_producer.py
+   - Переход с одного fetch_weather() на два режима:
+     fetch_forecast() — current + daily max/min для открытых маркетов
+     fetch_historical() — archive-api.open-meteo.com для закрытых
+   - get_market_locations() возвращает (open_cities, closed_locations)
+   - Записи включают data_type: "forecast" | "historical"
+   - SSL-проблема на Windows (UNEXPECTED_EOF): Python OpenSSL несовместим
+     с корпоративной сетью; решено через PowerShell subprocess с
+     -EncodedCommand (использует Windows Schannel)
+
+3. CorrelationJob.java
+   - Два отдельных ValueState: latestForecastWeather, latestHistoricalWeather
+   - flatMap2 маршрутизирует по data_type: historical → historicalState
+   - flatMap1 для closed=true читает из latestHistoricalWeather
+   - detectQuestionType(): HIGHEST / LOWEST / EXACT по тексту вопроса
+   - Для HIGHEST берёт temperature_2m_max, для LOWEST — temperature_2m_min
+   - Для закрытых маркетов: winner field как ground truth (fallback на
+     temperature comparison если winner=null)
+   - Новые поля в выходной записи: question_type, data_type, market_closed
+   - Offset weather source переключён на earliest (новый group ID
+     correlation-job-weather-v2 чтобы сбросить committed offsets)
+
+4. AccuracyJob.java (новый, Компонент 4)
+   - Читает из market-weather-correlations
+   - KeyBy LOCATION_NAME, накапливает rolling stats через ValueState
+   - Метрики: total_count, correct_count, accuracy_rate, avg_prediction_error,
+     max_prediction_error + отдельно closed_* для ground truth метрик
+   - Пишет в market-accuracy-aggregates после каждой входящей записи
+
+ИНФРАСТРУКТУРНЫЕ ИЗМЕНЕНИЯ
+- docker-compose.yml: taskmanager.numberOfTaskSlots: 2 → 4,
+  taskmanager.memory.process.size: 2048m (для двух параллельных джобов)
+- Python зависимости добавлены: kafka-python-ng (fix six.moves на Python 3.14),
+  httpx (SSL fallback), geopy
+
+ПРОБЛЕМЫ И РЕШЕНИЯ
+
+11. SSL UNEXPECTED_EOF при запросах к Open-Meteo из Python: Python OpenSSL
+    не проходит через корпоративную TLS-инспекцию. PowerShell (Windows
+    Schannel) работает. Решение: ps_get() через subprocess + EncodedCommand.
+
+12. kafka-python six.moves ImportError на Python 3.14: kafka-python не
+    поддерживает Python 3.12+. Решение: pip install kafka-python-ng.
+
+13. CorrelationJob читал weather с latest offset (committed group offsets
+    блокировали earliest): исторические записи оставались за committed
+    offset. Решение: новый group ID сбрасывает committed offsets.
+
+14. Debug-код вызывал m.find() дважды на одном Matcher — второй вызов
+    возвращал false → early return, корреляции не эмитились.
+
+15. market-accuracy-aggregates создан с cleanup.policy=compact, но
+    Flink KafkaSink отправляет без ключа → Kafka отклоняет. Решение:
+    пересоздать топик без compact.
+
+ТЕКУЩИЙ СТАТУС (конец сессии 2)
+---------------------------------
+✓ Стратегия C полностью реализована
+✓ Open market correlations: data_type=forecast, ~3700+ записей
+✓ Closed market correlations: data_type=historical, ~3800+ записей
+✓ AccuracyJob написан и скомпилирован в fat JAR
+✗ AccuracyJob не удалось стабилизировать (проблемы с compact topic,
+  OOM TaskManager при 2 слотах, требует 4 слота + 2GB)
+
+Следующая сессия:
+- Убедиться что AccuracyJob RUNNING стабильно
+- Компонент 5: Anomaly Detection + Arbitrage Alerts
+- Компонент 7: Dashboard (Grafana или Streamlit)
