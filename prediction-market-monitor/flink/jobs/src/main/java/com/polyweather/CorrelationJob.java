@@ -26,7 +26,7 @@ public class CorrelationJob {
 
     static final ObjectMapper MAPPER = new ObjectMapper();
     static final String BOOTSTRAP = "kafka:29092";
-    static final Pattern TEMP_PATTERN = Pattern.compile("(\\d+(?:\\.\\d+)?)\\s*°?C");
+    static final Pattern TEMP_PATTERN = Pattern.compile("(\\d+(?:\\.\\d+)?)\\s*°?([CF])");
 
     enum QuestionType { HIGHEST, LOWEST, EXACT }
 
@@ -161,6 +161,9 @@ public class CorrelationJob {
             Matcher m = TEMP_PATTERN.matcher(question);
             if (!m.find()) return;
             double targetTemp = Double.parseDouble(m.group(1));
+            if ("F".equals(m.group(2))) {
+                targetTemp = (targetTemp - 32) * 5.0 / 9.0;
+            }
 
             // Determine yes_price
             double yesPrice = 0.0;
