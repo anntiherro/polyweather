@@ -5,12 +5,19 @@ Reads from 3 Kafka topics and writes to PostgreSQL.
   arbitrage-alerts            → alerts
 """
 import json
+import os
 import time
 import psycopg2
 from kafka import KafkaConsumer
 
-KAFKA_BOOTSTRAP = "localhost:9092"
-PG_DSN = "host=localhost port=5432 dbname=polyweather user=polyweather password=polyweather"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+PG_DSN = "host={} port={} dbname={} user={} password={}".format(
+    os.getenv("POSTGRES_HOST", "localhost"),
+    os.getenv("POSTGRES_PORT", "5432"),
+    os.getenv("POSTGRES_DB", "polyweather"),
+    os.getenv("POSTGRES_USER", "polyweather"),
+    os.getenv("POSTGRES_PASSWORD", "polyweather"),
+)
 
 TOPICS = [
     "market-weather-correlations",

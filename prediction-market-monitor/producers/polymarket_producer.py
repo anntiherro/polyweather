@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import re
 import requests
@@ -8,6 +9,7 @@ from kafka import KafkaProducer
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 KAFKA_TOPIC = "polymarket-predictions-raw"
 POLL_INTERVAL = 300  # 5 minutes
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 
 WEATHER_TAG_SLUG = "daily-temperature"
 
@@ -17,7 +19,7 @@ CITY_PATTERN = re.compile(r"\bin\s+([A-Z][a-zA-Z\s']+?)(?:\s+be\s|\s+on\s|\s+dur
 _price_cache: dict[str, tuple] = {}
 
 producer = KafkaProducer(
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=KAFKA_BOOTSTRAP,
     value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
     acks="all",
     retries=3,

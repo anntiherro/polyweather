@@ -4,67 +4,82 @@ services:
     image: confluentinc/cp-kafka:latest
     container_name: kafka
     hostname: kafka
-
     ports:
       - "9092:9092"
-
+      - "9101:9101"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
-
       KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_INTERNAL://:29092,CONTROLLER://:29093
-
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
-
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
-
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
-
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-
       KAFKA_LOG_RETENTION_HOURS: 168
-
       KAFKA_COMPRESSION_TYPE: snappy
-
+      # JMX for Prometheus
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: kafka
     volumes:
       - kafka-data:/var/lib/kafka/data
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    command:
+      - "--kafka.server=kafka:29092"
+    ports:
+      - "9308:9308"
+    depends_on:
+      - kafka
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.25"
 
   flink-jobmanager:
     image: apache/flink:latest
     container_name: flink-jobmanager
-
     ports:
       - "8081:8081"
-
     command: jobmanager
-
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         state.checkpoints.dir: file:///opt/flink/checkpoints
         execution.checkpointing.interval: 60000
-
+        restart-strategy: exponential-delay
+        restart-strategy.exponential-delay.initial-backoff: 1 s
+        restart-strategy.exponential-delay.max-backoff: 2 min
+        restart-strategy.exponential-delay.backoff-multiplier: 2.0
+        restart-strategy.exponential-delay.reset-backoff-threshold: 1 h
+        restart-strategy.exponential-delay.jitter-factor: 0.1
+        restart-strategy.exponential-delay.attempts-before-reset-backoff: 5
     volumes:
       - ./flink/checkpoints:/opt/flink/checkpoints
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
 
   flink-taskmanager:
     image: apache/flink:latest
     container_name: flink-taskmanager
-
     depends_on:
       - flink-jobmanager
-
     command: taskmanager
-
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
@@ -72,9 +87,20 @@ services:
         taskmanager.memory.process.size: 2048m
         state.checkpoints.dir: file:///opt/flink/checkpoints
         execution.checkpointing.interval: 60000
-
+        restart-strategy: exponential-delay
+        restart-strategy.exponential-delay.initial-backoff: 1 s
+        restart-strategy.exponential-delay.max-backoff: 2 min
+        restart-strategy.exponential-delay.backoff-multiplier: 2.0
+        restart-strategy.exponential-delay.reset-backoff-threshold: 1 h
+        restart-strategy.exponential-delay.jitter-factor: 0.1
+        restart-strategy.exponential-delay.attempts-before-reset-backoff: 5
     volumes:
       - ./flink/checkpoints:/opt/flink/checkpoints
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: "2.0"
 
   kafka-init:
     image: confluentinc/cp-kafka:latest
@@ -104,27 +130,55 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     depends_on:
       - kafka
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
 
   postgres:
     image: postgres:16
     container_name: postgres
     ports:
       - "5432:5432"
-    environment:
-      POSTGRES_DB: polyweather
-      POSTGRES_USER: polyweather
-      POSTGRES_PASSWORD: polyweather
+    env_file:
+      - .env
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    depends_on:
+      - kafka-exporter
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana-data:/var/lib/grafana
@@ -132,8 +186,15 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards
     depends_on:
       - postgres
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
 
 volumes:
   kafka-data:
   postgres-data:
+  prometheus-data:
   grafana-data:

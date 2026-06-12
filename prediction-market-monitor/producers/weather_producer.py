@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ def ps_get(url: str, params: dict) -> dict | None:
     if result.returncode == 0 and result.stdout.strip():
         return json.loads(result.stdout)
     return None
-KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 IN_TOPIC = "polymarket-predictions-raw"
 OUT_TOPIC = "weather-actuals-raw"
 POLL_INTERVAL = 900  # 15 minutes
