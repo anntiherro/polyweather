@@ -337,3 +337,69 @@ NYC и другие °F маркеты теперь присутствуют в 
 - Компонент 5: AnomalyJob (→ arbitrage-alerts топик)
 - PostgreSQL + Grafana dashboard
 - Flink restart strategy в docker-compose
+
+
+СЕССИЯ 4 — June 12, 2026
+--------------------------
+
+КОМПОНЕНТ 5: ANOMALY DETECTION JOB
+
+Написан AnomalyJob.java — последнее недостающее Flink звено в цепочке.
+
+Два входных потока:
+- market-accuracy-aggregates → accuracy anomaly detection per city
+- market-weather-correlations → arbitrage detection per market
+
+Четыре типа алертов в arbitrage-alerts:
+- ACCURACY_DROP    — accuracy упала >20% vs предыдущее окно для города
+- ACCURACY_ANOMALY — accuracy отклонилась >2σ от running baseline
+                     (Welford online algorithm для mean/variance)
+- ARBITRAGE        — price_sum != 1.0 (флаг от upstream producer)
+- HIGH_ERROR       — PREDICTION_ERROR > 0.70 на одном маркете
+
+Алерты сразу появились на реальных данных:
+  Chengdu: prediction_error=0.999 (маркет на 31°C при actual=31.1°C торговался по 0.001)
+  Hong Kong: prediction_error=0.855
+  London: prediction_error=0.705
+
+РЕФАКТОР AccuracyJob — SLIDING WINDOWS
+
+Переписан AccuracyJob с правильными sliding windows как в спеке
+(было: per-event аккумуляция → тысячи дублей):
+
+- SlidingProcessingTimeWindows(1 час, 15 мин slide)
+- Эмитит 1 агрегат на город каждые 15 минут, не на каждое сообщение
+- Добавлен bias_score = mean(yes_price - actual_outcome) для детекции
+  систематической переоценки/недооценки рынка
+- Добавлены window_start / window_end в выходную запись
+
+СКРИПТ ЗАПУСКА start.ps1
+
+Создан start.ps1 в корне проекта — поднимает весь стек одной командой:
+1. docker compose up -d
+2. Ждёт готовности Flink (polling /overview)
+3. mvn package (пересборка JAR если код менялся)
+4. Загружает JAR в Flink REST API
+5. Сабмитит все 3 джоба (Correlation, Accuracy, Anomaly)
+6. Открывает оба продюсера в отдельных окнах
+
+Запуск: .\start.ps1 из корня проекта
+
+ОЧИСТКА ТОПИКОВ
+
+Все 5 топиков очищены от исторических данных (разные дни, >40k сообщений)
+через kafka-delete-records до latest offset. Топики сохранены, только
+данные удалены. Теперь пайплайн работает только с данными за сегодня.
+
+ТЕКУЩИЙ СТАТУС (сессия 4 в процессе)
+--------------------------------------
+✓ AnomalyJob написан, RUNNING, пишет реальные алерты
+✓ AccuracyJob переписан со sliding windows (1h/15min)
+✓ start.ps1 — полный автозапуск стека
+✓ Все топики очищены, пайплайн работает на свежих данных
+✓ Все 3 Flink джоба RUNNING
+
+В процессе:
+- PostgreSQL контейнер + схема
+- Grafana dashboard
+- Flink restart strategy в docker-compose

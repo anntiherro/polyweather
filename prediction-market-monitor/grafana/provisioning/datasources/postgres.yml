@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: PostgreSQL
+    type: grafana-postgresql-datasource
+    uid: PCC52D03280B7034C
+    url: postgres:5432
+    user: polyweather
+    secureJsonData:
+      password: polyweather
+    jsonData:
+      database: polyweather
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    isDefault: true

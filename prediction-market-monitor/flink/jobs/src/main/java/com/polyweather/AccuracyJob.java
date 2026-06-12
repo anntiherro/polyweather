@@ -4,29 +4,34 @@ import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.functions.OpenContext;
-import org.apache.flink.api.common.functions.RichMapFunction;
-import org.apache.flink.api.common.state.ValueState;
-import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
 
+import java.time.Duration;
 import java.time.Instant;
 
 /**
  * Component 4: Accuracy Aggregation
  *
- * Reads market-weather-correlations and maintains rolling accuracy stats per city.
- * Emits an updated aggregate record after every incoming correlation.
+ * Sliding 1-hour window, 15-minute slide (processing time).
+ * Emits one aggregate per city per slide — not per message.
  *
- * Separate stats for:
- *   - forecast-based (open markets, intra-day signal)
- *   - historical-based (closed markets, ground truth)
+ * Metrics per window:
+ *   - accuracy_rate           overall % correct
+ *   - avg_prediction_error    mean absolute error
+ *   - max_prediction_error    worst single error in window
+ *   - bias_score              mean signed error (+ = over-predicting Yes)
+ *   - closed_accuracy_rate    ground-truth only (closed markets)
+ *   - total_count / correct_count
  */
 public class AccuracyJob {
 
@@ -40,7 +45,7 @@ public class AccuracyJob {
         KafkaSource<String> correlationSource = KafkaSource.<String>builder()
                 .setBootstrapServers(BOOTSTRAP)
                 .setTopics("market-weather-correlations")
-                .setGroupId("accuracy-job-v1")
+                .setGroupId("accuracy-job-v2")
                 .setStartingOffsets(OffsetsInitializer.earliest())
                 .setValueOnlyDeserializer(new org.apache.flink.api.common.serialization.SimpleStringSchema())
                 .build();
@@ -57,119 +62,121 @@ public class AccuracyJob {
                 correlationSource, WatermarkStrategy.noWatermarks(), "correlations");
 
         correlations
-                .keyBy(msg -> extractField(msg, "LOCATION_NAME"))
-                .map(new AccuracyAggregator())
+                .filter(msg -> {
+                    try {
+                        JsonNode n = MAPPER.readTree(msg);
+                        String loc = n.path("LOCATION_NAME").asText("");
+                        return !loc.isEmpty() && !"UNKNOWN".equals(loc);
+                    } catch (Exception e) { return false; }
+                })
+                .keyBy(msg -> {
+                    try { return MAPPER.readTree(msg).path("LOCATION_NAME").asText("UNKNOWN"); }
+                    catch (Exception e) { return "UNKNOWN"; }
+                })
+                .window(SlidingProcessingTimeWindows.of(
+                        Duration.ofHours(1),
+                        Duration.ofMinutes(15)))
+                .aggregate(new AccuracyAccumulator(), new WindowResultFunction())
                 .filter(s -> s != null)
                 .sinkTo(sink);
 
         env.execute("Polymarket Accuracy Aggregation");
     }
 
-    static String extractField(String json, String field) {
-        try {
-            JsonNode node = MAPPER.readTree(json);
-            JsonNode val = node.get(field);
-            return val != null && !val.isNull() ? val.asText() : "UNKNOWN";
-        } catch (Exception e) {
-            return "UNKNOWN";
+    // --- Accumulator ---
+
+    static class Acc {
+        String location = "";
+        long total = 0, correct = 0;
+        long closedTotal = 0, closedCorrect = 0;
+        double sumError = 0, maxError = 0;
+        double sumSignedError = 0; // for bias: (yes_price - actual_outcome)
+    }
+
+    static class AccuracyAccumulator implements AggregateFunction<String, Acc, Acc> {
+        @Override public Acc createAccumulator() { return new Acc(); }
+
+        @Override
+        public Acc add(String msg, Acc acc) {
+            try {
+                JsonNode n = MAPPER.readTree(msg);
+                acc.location = n.path("LOCATION_NAME").asText(acc.location);
+                int outcome = n.path("ACTUAL_OUTCOME").asInt(-1);
+                double error = n.path("PREDICTION_ERROR").asDouble(Double.NaN);
+                double yesPrice = n.path("yes_price").asDouble(Double.NaN);
+                boolean closed = n.path("market_closed").asBoolean(false);
+
+                if (outcome < 0 || Double.isNaN(error)) return acc;
+
+                acc.total++;
+                if (outcome == 1) acc.correct++;
+                acc.sumError += error;
+                if (error > acc.maxError) acc.maxError = error;
+
+                if (!Double.isNaN(yesPrice)) {
+                    acc.sumSignedError += (yesPrice - outcome);
+                }
+
+                if (closed) {
+                    acc.closedTotal++;
+                    if (outcome == 1) acc.closedCorrect++;
+                }
+            } catch (Exception ignored) {}
+            return acc;
+        }
+
+        @Override public Acc getResult(Acc acc) { return acc; }
+        @Override public Acc merge(Acc a, Acc b) {
+            a.total += b.total;
+            a.correct += b.correct;
+            a.closedTotal += b.closedTotal;
+            a.closedCorrect += b.closedCorrect;
+            a.sumError += b.sumError;
+            a.sumSignedError += b.sumSignedError;
+            if (b.maxError > a.maxError) a.maxError = b.maxError;
+            if (a.location.isEmpty()) a.location = b.location;
+            return a;
         }
     }
 
-    public static class AccuracyAggregator extends RichMapFunction<String, String> {
+    // --- Window result function (attaches window metadata) ---
 
-        // All correlations (forecast + historical)
-        private ValueState<Long> totalCount;
-        private ValueState<Long> correctCount;
-        private ValueState<Double> sumPredictionError;
-
-        // Closed market correlations only (ground truth)
-        private ValueState<Long> closedCount;
-        private ValueState<Long> closedCorrectCount;
-        private ValueState<Double> closedSumError;
-
-        // Largest observed prediction errors (arbitrage signals)
-        private ValueState<Double> maxPredictionError;
-
+    static class WindowResultFunction
+            extends ProcessWindowFunction<Acc, String, String, TimeWindow> {
         @Override
-        public void open(OpenContext ctx) {
-            totalCount          = getRuntimeContext().getState(new ValueStateDescriptor<>("total-count", Types.LONG));
-            correctCount        = getRuntimeContext().getState(new ValueStateDescriptor<>("correct-count", Types.LONG));
-            sumPredictionError  = getRuntimeContext().getState(new ValueStateDescriptor<>("sum-error", Types.DOUBLE));
-            closedCount         = getRuntimeContext().getState(new ValueStateDescriptor<>("closed-count", Types.LONG));
-            closedCorrectCount  = getRuntimeContext().getState(new ValueStateDescriptor<>("closed-correct-count", Types.LONG));
-            closedSumError      = getRuntimeContext().getState(new ValueStateDescriptor<>("closed-sum-error", Types.DOUBLE));
-            maxPredictionError  = getRuntimeContext().getState(new ValueStateDescriptor<>("max-error", Types.DOUBLE));
-        }
+        public void process(String key, Context ctx, Iterable<Acc> elements, Collector<String> out) {
+            Acc acc = elements.iterator().next();
+            if (acc.total == 0) return;
 
-        @Override
-        public String map(String correlationJson) throws Exception {
-            JsonNode c;
+            double accuracyRate = (double) acc.correct / acc.total;
+            double avgError = acc.sumError / acc.total;
+            double biasScore = acc.sumSignedError / acc.total;
+            double closedAccuracy = acc.closedTotal > 0
+                    ? (double) acc.closedCorrect / acc.closedTotal : Double.NaN;
+
             try {
-                c = MAPPER.readTree(correlationJson);
-            } catch (Exception e) {
-                return null;
-            }
-
-            String location = c.path("LOCATION_NAME").asText("");
-            if (location.isEmpty() || "UNKNOWN".equals(location)) return null;
-
-            int outcome = c.path("ACTUAL_OUTCOME").asInt(-1);
-            double error = c.path("PREDICTION_ERROR").asDouble(Double.NaN);
-            boolean isClosed = c.path("market_closed").asBoolean(false);
-
-            if (outcome < 0 || Double.isNaN(error)) return null;
-
-            // Update all-time stats
-            long tc = orZero(totalCount.value()) + 1;
-            long cc = orZero(correctCount.value()) + (outcome == 1 ? 1 : 0);
-            double se = orZeroD(sumPredictionError.value()) + error;
-            double maxErr = Math.max(orZeroD(maxPredictionError.value()), error);
-
-            totalCount.update(tc);
-            correctCount.update(cc);
-            sumPredictionError.update(se);
-            maxPredictionError.update(maxErr);
-
-            // Update closed-market (ground truth) stats
-            long clc = orZero(closedCount.value());
-            long clcc = orZero(closedCorrectCount.value());
-            double clse = orZeroD(closedSumError.value());
-            if (isClosed) {
-                clc++;
-                clcc += (outcome == 1 ? 1 : 0);
-                clse += error;
-                closedCount.update(clc);
-                closedCorrectCount.update(clcc);
-                closedSumError.update(clse);
-            }
-
-            double accuracyRate = tc > 0 ? (double) cc / tc : 0.0;
-            double avgError = tc > 0 ? se / tc : 0.0;
-            double closedAccuracy = clc > 0 ? (double) clcc / clc : 0.0;
-            double closedAvgError = clc > 0 ? clse / clc : 0.0;
-
-            ObjectNode result = MAPPER.createObjectNode();
-            result.put("LOCATION_NAME", location);
-            result.put("total_count", tc);
-            result.put("correct_count", cc);
-            result.put("accuracy_rate", round(accuracyRate));
-            result.put("avg_prediction_error", round(avgError));
-            result.put("max_prediction_error", round(maxErr));
-            result.put("closed_count", clc);
-            result.put("closed_correct_count", clcc);
-            result.put("closed_accuracy_rate", round(closedAccuracy));
-            result.put("closed_avg_error", round(closedAvgError));
-            result.put("last_question_type", c.path("question_type").asText(""));
-            result.put("LAST_UPDATED", Instant.now().toString());
-
-            return MAPPER.writeValueAsString(result);
+                ObjectNode result = MAPPER.createObjectNode();
+                result.put("LOCATION_NAME", acc.location);
+                result.put("window_start", Instant.ofEpochMilli(ctx.window().getStart()).toString());
+                result.put("window_end", Instant.ofEpochMilli(ctx.window().getEnd()).toString());
+                result.put("total_count", acc.total);
+                result.put("correct_count", acc.correct);
+                result.put("accuracy_rate", round(accuracyRate));
+                result.put("avg_prediction_error", round(avgError));
+                result.put("max_prediction_error", round(acc.maxError));
+                result.put("bias_score", round(biasScore));
+                result.put("closed_count", acc.closedTotal);
+                result.put("closed_correct_count", acc.closedCorrect);
+                if (!Double.isNaN(closedAccuracy)) {
+                    result.put("closed_accuracy_rate", round(closedAccuracy));
+                }
+                result.put("LAST_UPDATED", Instant.now().toString());
+                out.collect(MAPPER.writeValueAsString(result));
+            } catch (Exception ignored) {}
         }
+    }
 
-        private long orZero(Long v) { return v == null ? 0L : v; }
-        private double orZeroD(Double v) { return v == null ? 0.0 : v; }
-
-        private double round(double v) {
-            return Math.round(v * 10000.0) / 10000.0;
-        }
+    static double round(double v) {
+        return Math.round(v * 10000.0) / 10000.0;
     }
 }
