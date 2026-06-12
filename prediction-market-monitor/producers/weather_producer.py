@@ -5,9 +5,45 @@ import time
 from datetime import datetime, timezone
 from kafka import KafkaProducer, KafkaConsumer
 from geopy.geocoders import Nominatim
+from jsonschema import validate, ValidationError
 
 OPEN_METEO_FORECAST_API = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE_API = "https://archive-api.open-meteo.com/v1/archive"
+
+WEATHER_SCHEMA = {
+    "type": "object",
+    "required": ["latitude", "longitude", "data_type", "daily", "LOCATION_NAME", "POLL_TIMESTAMP"],
+    "properties": {
+        "latitude":        {"type": "number"},
+        "longitude":       {"type": "number"},
+        "data_type":       {"type": "string", "enum": ["forecast", "historical"]},
+        "LOCATION_NAME":   {"type": "string", "minLength": 1},
+        "POLL_TIMESTAMP":  {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"},
+        "daily": {
+            "type": "object",
+            "required": ["temperature_2m_max", "temperature_2m_min"],
+            "properties": {
+                "temperature_2m_max": {"type": ["number", "null"]},
+                "temperature_2m_min": {"type": ["number", "null"]},
+            },
+        },
+        "current": {"type": ["object", "null"]},
+        "date":    {"type": "string"},
+    },
+    "additionalProperties": True,
+}
+
+_schema_errors = 0
+
+def validate_record(record: dict) -> bool:
+    global _schema_errors
+    try:
+        validate(instance=record, schema=WEATHER_SCHEMA)
+        return True
+    except ValidationError as e:
+        _schema_errors += 1
+        print(f"[schema] INVALID record dropped ({e.message}) | city={record.get('LOCATION_NAME')}")
+        return False
 
 
 def ps_get(url: str, params: dict) -> dict | None:
@@ -173,6 +209,8 @@ def poll_cycle():
             "LOCATION_NAME": city,
             "POLL_TIMESTAMP": poll_ts,
         }
+        if not validate_record(record):
+            continue
         producer.send(OUT_TOPIC, value=record)
         max_t = record["daily"]["temperature_2m_max"]
         min_t = record["daily"]["temperature_2m_min"]
@@ -205,6 +243,8 @@ def poll_cycle():
             "LOCATION_NAME": city,
             "POLL_TIMESTAMP": poll_ts,
         }
+        if not validate_record(record):
+            continue
         producer.send(OUT_TOPIC, value=record)
         max_t = record["daily"]["temperature_2m_max"]
         min_t = record["daily"]["temperature_2m_min"]
@@ -213,7 +253,7 @@ def poll_cycle():
         time.sleep(1)
 
     producer.flush()
-    print(f"[{poll_ts}] sent {sent} weather records")
+    print(f"[{poll_ts}] sent {sent} weather records | schema_errors_total={_schema_errors}")
 
 
 def main():

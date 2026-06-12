@@ -5,6 +5,7 @@ import re
 import requests
 from datetime import datetime, timezone, timedelta
 from kafka import KafkaProducer
+from jsonschema import validate, ValidationError
 
 GAMMA_API = "https://gamma-api.polymarket.com/events"
 KAFKA_TOPIC = "polymarket-predictions-raw"
@@ -12,6 +13,51 @@ POLL_INTERVAL = 300  # 5 minutes
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 
 WEATHER_TAG_SLUG = "daily-temperature"
+
+POLYMARKET_SCHEMA = {
+    "type": "object",
+    "required": ["condition_id", "question", "tokens", "LOCATION_NAME", "POLL_TIMESTAMP"],
+    "properties": {
+        "condition_id":    {"type": ["string", "null"]},
+        "question":        {"type": "string", "minLength": 5},
+        "market_slug":     {"type": ["string", "null"]},
+        "end_date_iso":    {"type": ["string", "null"]},
+        "game_start_time": {"type": ["string", "null"]},
+        "closed":          {"type": "boolean"},
+        "active":          {"type": "boolean"},
+        "tokens": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+                "type": "object",
+                "required": ["outcome", "price"],
+                "properties": {
+                    "outcome": {"type": "string"},
+                    "price":   {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "winner":  {"type": ["boolean", "null"]},
+                },
+            },
+        },
+        "LOCATION_NAME":   {"type": ["string", "null"]},
+        "POLL_TIMESTAMP":  {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"},
+        "price_sum":       {"type": "number", "minimum": 0.0},
+        "arbitrage_flag":  {"type": "boolean"},
+    },
+    "additionalProperties": True,
+}
+
+
+_schema_errors = 0
+
+def validate_record(record: dict) -> bool:
+    global _schema_errors
+    try:
+        validate(instance=record, schema=POLYMARKET_SCHEMA)
+        return True
+    except ValidationError as e:
+        _schema_errors += 1
+        print(f"[schema] INVALID record dropped ({e.message}) | cond={record.get('condition_id')}")
+        return False
 
 WEATHER_KEYWORDS = ["rain", "temperature", "snow", "precipitation", "wind", "storm", "weather", "hurricane", "flood"]
 CITY_PATTERN = re.compile(r"\bin\s+([A-Z][a-zA-Z\s']+?)(?:\s+be\s|\s+on\s|\s+during|\s+for|\?|$)")
@@ -195,6 +241,9 @@ def process_events(events: list):
                     continue
                 _price_cache[market.get("conditionId")] = prices_key
 
+            if not validate_record(record):
+                continue
+
             producer.send(KAFKA_TOPIC, value=record)
             sent += 1
 
@@ -202,7 +251,7 @@ def process_events(events: list):
                 print(f"[ARBITRAGE] {question[:60]} | sum={price_sum:.4f}")
 
     producer.flush()
-    print(f"[{poll_ts}] sent {sent} weather markets")
+    print(f"[{poll_ts}] sent {sent} weather markets | schema_errors_total={_schema_errors}")
 
 
 def main():
