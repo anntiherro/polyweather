@@ -399,7 +399,96 @@ NYC и другие °F маркеты теперь присутствуют в 
 ✓ Все топики очищены, пайплайн работает на свежих данных
 ✓ Все 3 Flink джоба RUNNING
 
-В процессе:
-- PostgreSQL контейнер + схема
-- Grafana dashboard
+POSTGRESQL + pg_consumer
+
+PostgreSQL 16 добавлен в docker-compose.yml:
+- 3 таблицы: correlations, accuracy_windows, alerts (с индексами)
+- init.sql монтируется в /docker-entrypoint-initdb.d/ — схема применяется автоматически
+
+Написан pg_consumer.py:
+- Читает из 3 топиков: market-weather-correlations, market-accuracy-aggregates, arbitrage-alerts
+- Batch коммиты каждые 100 записей + reconnect-логика при падении PG
+- Маршрутизация: каждый топик → своя таблица через HANDLERS dict
+
+GRAFANA DASHBOARD
+
+Grafana добавлена в docker-compose, provisioning через YAML.
+
+Ключевые проблемы при настройке Grafana 13:
+- Datasource "database" поле должно быть внутри jsonData, не на верхнем уровне
+- type должен быть grafana-postgresql-datasource (не просто postgres)
+- Каждый panel target требует rawQuery: true + editorMode: "code" + refId
+- Stat панели: reduceOptions.calcs=["lastNotNull"], fields="/^value$/"
+- Barchart тип в Grafana 13 не отображал данные → заменён на bargauge
+
+Итоговый dashboard polyweather.json: 14 панелей — stat, bargauge, table, piechart,
+timeseries. Данные из PostgreSQL через rawSql запросы.
+
+ОЧИСТКА СТРУКТУРЫ ПРОЕКТА
+- Удалены: test-producer.py (MVP заглушка), dependency-reduced-pom.xml (Maven артефакт)
+- requirements.txt обновлён: kafka-python-ng, requests, geopy, python-snappy, psycopg2-binary
+
+ТЕКУЩИЙ СТАТУС (конец сессии 4)
+---------------------------------
+✓ AnomalyJob, AccuracyJob, CorrelationJob — все RUNNING
+✓ PostgreSQL работает, pg_consumer пишет данные
+✓ Grafana dashboard показывает реальные данные из PG (14 панелей)
+✓ start.ps1 поднимает весь стек одной командой
+✓ Структура проекта очищена
+
+Следующая сессия:
 - Flink restart strategy в docker-compose
+- Prometheus метрики
+- Schema Registry / Avro (Component 6)
+
+
+СЕССИЯ 5 — June 12, 2026
+--------------------------
+
+ИНФРАСТРУКТУРА: PROMETHEUS, FLINK RESTART STRATEGY, RESOURCE LIMITS, .ENV
+
+Flink restart strategy (exponential-delay) добавлена в docker-compose.yml
+для JobManager и TaskManager:
+- initial-backoff: 1s
+- max-backoff: 2 минуты
+- backoff-multiplier: 2.0
+- reset-backoff-threshold: 1 час
+- attempts-before-reset: 5 (не более 5 рестартов в течение часа)
+
+Prometheus добавлен в docker-compose.yml:
+- Контейнер prom/prometheus:latest, retention 15 дней
+- Скрейпит kafka-exporter:9308 (kafka метрики через danielqsj/kafka-exporter)
+- Скрейпит flink-jobmanager:9249 (Flink JMX endpoint)
+- Конфиг: prediction-market-monitor/prometheus/prometheus.yml
+
+Grafana добавлена зависимость от Prometheus (depends_on).
+
+Resource limits на все контейнеры (memory + CPU):
+- kafka:           1g / 1.0 CPU
+- kafka-exporter:  128m / 0.25 CPU
+- flink-jobmanager: 1g / 1.0 CPU
+- flink-taskmanager: 2.5g / 2.0 CPU
+- kafka-ui:        512m / 0.5 CPU
+- postgres:        512m / 0.5 CPU
+- prometheus:      512m / 0.5 CPU
+- grafana:         512m / 0.5 CPU
+
+.env файл (prediction-market-monitor/.env, не в git):
+- Credentials: POSTGRES_*, KAFKA_BOOTSTRAP, GF_SECURITY_ADMIN_PASSWORD
+- docker-compose использует env_file: .env для postgres и grafana
+- Продюсеры (polymarket_producer, weather_producer, pg_consumer) читают
+  credentials через os.getenv() с fallback на дефолтные значения
+
+ТЕКУЩИЙ СТАТУС (конец сессии 5)
+---------------------------------
+✓ Flink exponential restart strategy — в docker-compose
+✓ Prometheus + kafka-exporter — метрики собираются
+✓ Resource limits — на всех контейнерах
+✓ .env — credentials вынесены из кода
+✓ Все изменения запушены в GitHub
+
+Остаётся по спеке:
+- Schema Registry + Avro (Component 6)
+- Deduplication в Flink (keyed state, TTL 1h)
+- Dashboard: geographical map, heatmap, scatter plot
+- Документация: DEPLOYMENT.md, architecture diagram, runbook
